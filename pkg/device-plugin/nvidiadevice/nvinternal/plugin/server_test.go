@@ -1200,8 +1200,16 @@ func TestAllocatePreservesContainerOrderWhenOneContainerFallsBack(t *testing.T) 
 
 type mockListAndWatchServer struct {
 	grpc.ServerStream
+	ctx      context.Context
 	sendErrs []error
 	sent     []*kubeletdevicepluginv1beta1.ListAndWatchResponse
+}
+
+func (m *mockListAndWatchServer) Context() context.Context {
+	if m.ctx != nil {
+		return m.ctx
+	}
+	return context.Background()
 }
 
 func (m *mockListAndWatchServer) Send(response *kubeletdevicepluginv1beta1.ListAndWatchResponse) error {
@@ -1243,6 +1251,48 @@ func TestListAndWatchSendError(t *testing.T) {
 		err := plugin.ListAndWatch(&kubeletdevicepluginv1beta1.Empty{}, server)
 		require.NoError(t, err)
 		require.Len(t, server.sent, 2)
+	})
+
+	t.Run("context cancelled terminates stream", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		server := &mockListAndWatchServer{ctx: ctx}
+		plugin := &NvidiaDevicePlugin{
+			rm: mockRM, stop: make(chan any), health: make(chan *rm.Device, 1),
+			schedulerConfig: nvidia.NvidiaConfig{NodeDefaultConfig: nvidia.NodeDefaultConfig{DeviceSplitCount: ptr[uint](1)}},
+		}
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- plugin.ListAndWatch(&kubeletdevicepluginv1beta1.Empty{}, server)
+		}()
+
+		// Wait until the initial response has been sent
+		require.Eventually(t, func() bool {
+			return len(server.sent) == 1
+		}, time.Second, 10*time.Millisecond)
+
+		// Cancel the stream context while ListAndWatch is blocking on the select loop
+		cancel()
+
+		select {
+		case err := <-errCh:
+			require.ErrorIs(t, err, context.Canceled)
+		case <-time.After(2 * time.Second):
+			t.Fatal("ListAndWatch did not terminate within timeout after context cancellation")
+		}
+	})
+
+	t.Run("plugin stop terminates stream", func(t *testing.T) {
+		stop := make(chan any)
+		close(stop)
+		server := &mockListAndWatchServer{}
+		plugin := &NvidiaDevicePlugin{
+			rm: mockRM, stop: stop, health: make(chan *rm.Device, 1),
+			schedulerConfig: nvidia.NvidiaConfig{NodeDefaultConfig: nvidia.NodeDefaultConfig{DeviceSplitCount: ptr[uint](1)}},
+		}
+		err := plugin.ListAndWatch(&kubeletdevicepluginv1beta1.Empty{}, server)
+		require.NoError(t, err)
+		require.Len(t, server.sent, 1)
 	})
 }
 
